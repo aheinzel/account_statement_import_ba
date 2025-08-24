@@ -227,9 +227,10 @@ class AccountStatementImportBASheet(models.TransientModel):
             "name": _("Bank Austria import %s (EUR)") % stmt_date,
         }
 
-        result_tuple: Tuple[Optional[str], List[Dict]] = (None, [stmt_vals])
-        _logger.info("BA sheet: returning account/statement tuple with keys=%s", sorted(stmt_vals.keys()))
-        return [result_tuple]
+        # Return 3-tuple shape expected by your wizard: (currency_code, account_number, [statements])
+        payload: List[Tuple[str, Optional[str], List[Dict]]] = [("EUR", None, [stmt_vals])]
+        _logger.info("BA sheet: returning 3-tuple payload [(currency_code, account_number, [stmts])], stmt keys=%s", sorted(stmt_vals.keys()))
+        return payload
 
     def _read_excel_rows_strict(self, content: bytes, kind: str):
         # Read first sheet, map only declared headers; fail if required headers missing.
