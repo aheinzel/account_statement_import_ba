@@ -1,7 +1,7 @@
 {
     'name': 'Bank Austria Statement Import (XLS/XLSX, strict EUR)',
     'summary': 'Strict Bank Austria Excel importer for OCA account_statement_import_file (EUR only).',
-    'version': '18.0.3.3.3',
+    'version': '18.0.3.3.5',
     'category': 'Accounting',
     'author': 'You / OCA-compatible',
     'website': '',

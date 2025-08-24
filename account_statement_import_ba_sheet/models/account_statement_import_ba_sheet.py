@@ -3,7 +3,7 @@ import base64
 import io
 import logging
 from datetime import datetime, date
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 
 from odoo import _, models, fields
 from odoo.exceptions import UserError
@@ -53,7 +53,7 @@ def _excel_kind(content: bytes) -> Optional[str]:
 _DATE_PATTERNS = ["%Y-%m-%d","%d.%m.%Y","%d.%m.%y","%Y/%m/%d","%d/%m/%Y","%m/%d/%Y"]
 
 def _to_iso_date(val) -> str:
-    """Best-effort to get YYYY-MM-DD string (for logs and UID)."""
+    """Best-effort to get YYYY-MM-DD string (for logs and payload)."""
     if isinstance(val, datetime):
         return val.date().isoformat()
     if isinstance(val, date):
@@ -68,15 +68,6 @@ def _to_iso_date(val) -> str:
         return datetime.fromisoformat(s).date().isoformat()
     except Exception:
         return s
-
-def _to_date(val):
-    """Return a real date object using fields.Date.to_date on the iso string."""
-    iso = _to_iso_date(val)
-    try:
-        return fields.Date.to_date(iso)
-    except Exception:
-        # If even that fails, default to today to avoid invalid result structure
-        return fields.Date.today()
 
 def _parse_number(val) -> float:
     if val in (None, ""):
@@ -175,6 +166,7 @@ class AccountStatementImportBASheet(models.TransientModel):
         # Build transactions
         txs = []
         bad_currency_rows = []
+        dates = []
         for r in rows:
             # Currency enforcement (row-level)
             currency = str(r.get("currency") or "").strip().upper()
@@ -186,6 +178,8 @@ class AccountStatementImportBASheet(models.TransientModel):
             od_iso = _to_iso_date(r.get("operation date"))
             vd_iso = _to_iso_date(r.get("value date"))
             name = _build_name(r, amount, od_iso, vd_iso)
+            if od_iso:
+                dates.append(od_iso)
 
             # partner_name only (do not create partners)
             partner_name = None
@@ -204,8 +198,9 @@ class AccountStatementImportBASheet(models.TransientModel):
             unique_import_id = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest()
 
             tx = {
-                "date": _to_date(od_iso),  # real date object
+                "date": od_iso or fields.Date.today().isoformat(),  # ISO string
                 "name": name or _("Bank transaction"),
+                "payment_ref": name or _("Bank transaction"),
                 "amount": amount,
                 "unique_import_id": unique_import_id,
             }
@@ -221,15 +216,20 @@ class AccountStatementImportBASheet(models.TransientModel):
         if not txs:
             raise UserError(_("No transactions found after validation. Check required headers and that Currency is EUR on each row."))
 
-        stmt_date = max(tx["date"] for tx in txs if tx.get("date")) or fields.Date.today()
+        stmt_date = max(dates) if dates else fields.Date.today().isoformat()
+        total_amt = sum(t["amount"] for t in txs)
         stmt_vals = {
-            "date": stmt_date,                # real date object
+            "date": stmt_date,            # ISO string
             "transactions": txs,
-            "currency_code": "EUR",           # hint for downstream code
+            "currency_code": "EUR",
+            "balance_start": 0.0,
+            "balance_end_real": float(0.0 + total_amt),
             "name": _("Bank Austria import %s (EUR)") % stmt_date,
         }
-        _logger.info("BA sheet: built %d transactions, statement date %s.", len(txs), stmt_date)
-        return [stmt_vals]
+
+        result_tuple: Tuple[Optional[str], List[Dict]] = (None, [stmt_vals])
+        _logger.info("BA sheet: returning account/statement tuple with keys=%s", sorted(stmt_vals.keys()))
+        return [result_tuple]
 
     def _read_excel_rows_strict(self, content: bytes, kind: str):
         # Read first sheet, map only declared headers; fail if required headers missing.
