@@ -1,10 +1,13 @@
 import base64
 import io
+import logging
 from datetime import datetime, date
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 from odoo import _, models
 from odoo.exceptions import UserError
+
+_logger = logging.getLogger(__name__)
 
 # ---- Strict header lists (case-insensitive, exact labels only; no synonyms) ----
 REQUIRED_HEADERS = [
@@ -49,6 +52,7 @@ def _excel_kind(content: bytes) -> Optional[str]:
 _DATE_PATTERNS = ["%Y-%m-%d","%d.%m.%Y","%d.%m.%y","%Y/%m/%d","%d/%m/%Y","%m/%d/%Y"]
 
 def _to_iso_date(val) -> str:
+    """Best-effort to get YYYY-MM-DD; returns string always."""
     if isinstance(val, datetime):
         return val.date().isoformat()
     if isinstance(val, date):
@@ -59,7 +63,11 @@ def _to_iso_date(val) -> str:
             return datetime.strptime(s, fmt).date().isoformat()
         except Exception:
             pass
-    return s  # as-is; Odoo will validate later
+    # Already iso-like?
+    try:
+        return datetime.fromisoformat(s).date().isoformat()
+    except Exception:
+        return s  # as-is; Odoo will validate later
 
 def _parse_number(val) -> float:
     if val in (None, ""):
@@ -85,19 +93,12 @@ def _parse_number(val) -> float:
 def _format_amount(val: float) -> str:
     return f"{val:.2f}"
 
-def _clean_piece(x):
-    if x is None: return None
-    s = str(x).strip()
-    return s if s else None
-
 def _sanitize_val(v):
     """Replace newlines with spaces (collapse to single spaces) and replace '|' with '/'."""
     if v is None:
         return None
     s = str(v).replace("\r", " ").replace("\n", " ")
-    # collapse duplicate whitespace to single spaces
-    s = " ".join(s.split())
-    # replace pipe with slash to avoid escape sequences
+    s = " ".join(s.split())  # collapse whitespace
     s = s.replace("|", "/")
     s = s.strip()
     return s if s else None
@@ -118,12 +119,10 @@ def _build_name(row: Dict[str, object], amount: float, op_date_iso: str, val_dat
     pieces = []
     pieces.append(f"DIR={direction}")
     pieces.append(f"OD={op_date_iso}")
-
     # Booking text right after OD
     bt = _sanitize_val(row.get("booking text"))
     if bt:
         pieces.append(f"BT={bt}")
-
     pieces.append(f"VD={val_date_iso}")
     pieces.append(f"CUR={_sanitize_val(row.get('currency')) or 'EUR'}")
     pieces.append(f"AMT={_format_amount(amount)}")
@@ -142,17 +141,16 @@ def _build_name(row: Dict[str, object], amount: float, op_date_iso: str, val_dat
     rd = _sanitize_val(row.get("record data"))
     if rd is not None:  # include untrimmed; no dedupe
         pieces.append(f"RD={rd}")
-
     return " | ".join(pieces)
 
-class AccountStatementImportBASheetStrict(models.TransientModel):
+class AccountStatementImportBASheet(models.TransientModel):
     _inherit = "account.statement.import"
 
     def _parse_file(self, data_file):
         content = data_file if isinstance(data_file, bytes) else base64.b64decode(data_file)
         kind = _excel_kind(content)
         if kind is None:
-            raise UserError(_("Bank Austria importer supports only .XLSX or .XLS files."))
+            return super()._parse_file(data_file)  # not ours
 
         # Enforce EUR journal
         if hasattr(self, "journal_id") and self.journal_id:
@@ -161,6 +159,7 @@ class AccountStatementImportBASheetStrict(models.TransientModel):
                 raise UserError(_("This importer requires an EUR journal. Selected journal currency is '%s'.") % (j_cur and j_cur.name or "unknown"))
 
         rows, header_idx = self._read_excel_rows_strict(content, kind)
+        _logger.info("BA sheet: read %d data rows from Excel.", len(rows))
 
         # Build transactions
         txs = []
@@ -177,7 +176,7 @@ class AccountStatementImportBASheetStrict(models.TransientModel):
             val_date_iso = _to_iso_date(r.get("value date"))
             name = _build_name(r, amount, op_date_iso, val_date_iso)
 
-            # Choose partner_name based on direction
+            # partner_name only (do not create partners)
             partner_name = None
             if amount >= 0 and r.get("payer name"):
                 partner_name = str(r.get("payer name") or "").strip()
@@ -185,7 +184,8 @@ class AccountStatementImportBASheetStrict(models.TransientModel):
                 partner_name = str(r.get("payee name") or "").strip()
 
             # Reference: prefer 'Reference' else 'Record Number'
-            ref = _clean_piece(r.get("reference")) or _clean_piece(r.get("record number"))
+            ref = (r.get("reference") or r.get("record number") or None)
+            ref = str(ref).strip() if ref else None
 
             # Unique ID built on core fields (not truncated)
             uid_seed = f"{op_date_iso}|{val_date_iso}|{amount}|{r.get('booking text')}|{r.get('purpose text')}|{ref or ''}|{r.get('record data') or ''}"
@@ -193,9 +193,9 @@ class AccountStatementImportBASheetStrict(models.TransientModel):
             unique_import_id = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest()
 
             tx = {
-                "date": op_date_iso,  # use Operation date as posting date
-                "name": name,
-                "amount": amount,
+                "date": op_date_iso or datetime.today().date().isoformat(),
+                "name": name or _("Bank transaction"),
+                "amount": float(amount),
                 "unique_import_id": unique_import_id,
             }
             if ref:
@@ -208,14 +208,16 @@ class AccountStatementImportBASheetStrict(models.TransientModel):
             raise UserError(_("Non-EUR rows detected. All rows must have Currency = EUR. Offending currencies: %s") % ", ".join(sorted(set(bad_currency_rows))))
 
         if not txs:
-            raise UserError(_("No transactions found after validation."))
+            raise UserError(_("No transactions found after validation. Check required headers and that Currency is EUR on each row."))
 
         stmt_date = max(tx["date"] for tx in txs if tx.get("date")) or datetime.today().date().isoformat()
-        return [{
+        stmt_vals = {
             "date": stmt_date,
             "transactions": txs,
             "name": _("Bank Austria import %s (EUR)") % stmt_date,
-        }]
+        }
+        _logger.info("BA sheet: built %d transactions, statement date %s.", len(txs), stmt_date)
+        return [stmt_vals]
 
     def _read_excel_rows_strict(self, content: bytes, kind: str):
         # Read first sheet, map only declared headers; fail if required headers missing.

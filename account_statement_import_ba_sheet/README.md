@@ -15,6 +15,10 @@ Format:
 ```
 DIR=IN|OUT | OD=YYYY-MM-DD | BT=… | VD=YYYY-MM-DD | CUR=EUR | AMT=±#.## | CP=… | CP_ACC=… | CP_BC=… | PT=… | REF=… | RD=…
 ```
+## Debug build
+- Emits logs like `BA sheet: read 23 data rows`, `BA sheet: built 23 transactions…` in the Odoo logs.
+- Raises a clear `UserError` if no transactions are produced, instead of returning an empty result.
+
 ## Install
 1. Ensure **`account_statement_import_file`** is installed.
 2. `pip install openpyxl` (and `pip install "xlrd<2.0"` for old `.xls` if needed).
