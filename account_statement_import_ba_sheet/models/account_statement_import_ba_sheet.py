@@ -109,9 +109,9 @@ def _norm_acc(v: Optional[str]) -> str:
     return re.sub(r"\s+", "", (v or "")).upper()
 
 def _get_owner_accounts(self) -> Set[str]:
-    """Return a set with ONE owner account, sourced **only** from context:
-       - env.context['journal_id'] (preferred)
-       - or env.context['active_model']=='account.journal' and env.context['active_id']
+    """Owner account sourced **only from context**:
+       - env.context['journal_id'], or
+       - env.context['active_model']=='account.journal' and env.context['active_id']
        If none found → empty set.
     """
     owners: Set[str] = set()
@@ -127,7 +127,7 @@ def _get_owner_accounts(self) -> Set[str]:
     except Exception:
         pass
     owners.discard("")
-    _logger.info("BA sheet: owner accounts from context → %s", sorted(list(owners)) or ["<none>"])
+    _logger.debug("BA sheet: owner accounts from context → %s", sorted(list(owners)) or ["<none>"])
     return owners
 
 def _choose_partner_name(self, row: Dict[str, object]) -> Optional[str]:
@@ -269,18 +269,15 @@ class AccountStatementImportBASheet(models.TransientModel):
             return rows, idx
 
     def _parse_file(self, data_file):
-        _logger.info("BA sheet: start parsing")
+        _logger.debug("BA sheet: start parsing")
         content = data_file if isinstance(data_file, bytes) else base64.b64decode(data_file)
         kind = _excel_kind(content)
         if kind is None:
             _logger.debug("BA sheet: not xls/xlsx -> passing to super()")
             return super()._parse_file(data_file)
 
-        # Note: We NO LONGER rely on self.journal_id or company data for owner detection.
-        # EUR enforcement is skipped unless journal is bound with a currency (context-only approach).
-
         rows, header_idx = self._read_excel_rows_strict(content, kind)
-        _logger.info("BA sheet: read %d data rows from Excel.", len(rows))
+        _logger.debug("BA sheet: read %d data rows from Excel.", len(rows))
 
         txs = []
         first_date = None
@@ -334,7 +331,7 @@ class AccountStatementImportBASheet(models.TransientModel):
         else:
             sd = first_date or stmt_date
             stmt_name = _("Bank Austria import %s (EUR)") % sd
-        _logger.info("BA sheet: tx count=%d; sorted ASC; date range=%s..%s; stmt name=%s", len(txs), first_date, last_date, stmt_name)
+        _logger.debug("BA sheet: tx count=%d; sorted ASC; date range=%s..%s", len(txs), first_date, last_date)
 
         stmt_vals = {
             "date": stmt_date,
@@ -343,6 +340,6 @@ class AccountStatementImportBASheet(models.TransientModel):
         }
 
         payload = [("EUR", None, [stmt_vals])]
-        _logger.info("BA sheet: returning 3-tuple payload, stmt keys=%s", sorted(stmt_vals.keys()))
+        _logger.debug("BA sheet: returning 3-tuple payload")
         return payload
 
