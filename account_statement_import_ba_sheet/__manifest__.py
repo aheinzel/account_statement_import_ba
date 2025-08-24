@@ -14,5 +14,5 @@
         "python": ["openpyxl"]
     },
     "data": [],
-    "installable": true
+    "installable": True
 }
