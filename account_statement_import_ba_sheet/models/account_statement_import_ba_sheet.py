@@ -167,7 +167,7 @@ class AccountStatementImportBASheet(models.TransientModel):
         txs = []
         bad_currency_rows = []
         dates = []
-        for r in rows:
+        for idx, r in enumerate(rows, start=1):
             # Currency enforcement (row-level)
             currency = str(r.get("currency") or "").strip().upper()
             if currency not in ("EUR", "€"):
@@ -192,8 +192,8 @@ class AccountStatementImportBASheet(models.TransientModel):
             ref = (r.get("reference") or r.get("record number") or None)
             ref = str(ref).strip() if ref else None
 
-            # Unique ID built on core fields (not truncated)
-            uid_seed = f"{od_iso}|{vd_iso}|{amount}|{r.get('booking text')}|{r.get('purpose text')}|{ref or ''}|{r.get('record data') or ''}"
+            # Unique ID built on core fields (+ row index to ensure uniqueness within file)
+            uid_seed = f"{idx}|{od_iso}|{vd_iso}|{amount}|{r.get('booking text')}|{r.get('purpose text')}|{ref or ''}|{r.get('record data') or ''}"
             import hashlib
             unique_import_id = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest()
 
@@ -215,8 +215,13 @@ class AccountStatementImportBASheet(models.TransientModel):
         if not txs:
             raise UserError(_("No transactions found after validation. Check required headers and that Currency is EUR on each row."))
 
-        stmt_date = max(dates) if dates else fields.Date.today().isoformat()
+        # Diagnostics
         total_amt = sum(t["amount"] for t in txs)
+        _logger.info("BA sheet: tx count=%d, sum=%s", len(txs), total_amt)
+        for i, t in enumerate(txs[:3], start=1):
+            _logger.info("BA sheet: tx[%d] date=%s amount=%s name=%s uid=%s", i, t.get("date"), t.get("amount"), t.get("name")[:120], t.get("unique_import_id"))
+
+        stmt_date = max(dates) if dates else fields.Date.today().isoformat()
         stmt_vals = {
             "date": stmt_date,            # ISO string
             "transactions": txs,
