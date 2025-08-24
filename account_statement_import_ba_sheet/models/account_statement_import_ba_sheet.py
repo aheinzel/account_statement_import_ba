@@ -200,7 +200,6 @@ class AccountStatementImportBASheet(models.TransientModel):
             tx = {
                 "date": od_iso or fields.Date.today().isoformat(),  # ISO string
                 "name": name or _("Bank transaction"),
-                "payment_ref": name or _("Bank transaction"),
                 "amount": amount,
                 "unique_import_id": unique_import_id,
             }
@@ -221,7 +220,6 @@ class AccountStatementImportBASheet(models.TransientModel):
         stmt_vals = {
             "date": stmt_date,            # ISO string
             "transactions": txs,
-            "currency_code": "EUR",
             "balance_start": 0.0,
             "balance_end_real": float(0.0 + total_amt),
             "name": _("Bank Austria import %s (EUR)") % stmt_date,
@@ -229,7 +227,7 @@ class AccountStatementImportBASheet(models.TransientModel):
 
         # Return 3-tuple shape expected by your wizard: (currency_code, account_number, [statements])
         payload: List[Tuple[str, Optional[str], List[Dict]]] = [("EUR", None, [stmt_vals])]
-        _logger.info("BA sheet: returning 3-tuple payload [(currency_code, account_number, [stmts])], stmt keys=%s", sorted(stmt_vals.keys()))
+        _logger.info("BA sheet: returning 3-tuple payload w/ stmt keys=%s", sorted(stmt_vals.keys()))
         return payload
 
     def _read_excel_rows_strict(self, content: bytes, kind: str):

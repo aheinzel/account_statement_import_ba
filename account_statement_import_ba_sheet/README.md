@@ -1,25 +1,19 @@
 # Bank Austria Statement Import (XLS/XLSX, strict EUR)
 
-**3‑tuple return shape** build (matches your OCA wizard’s expectation):
+**Fix:** Remove `currency_code` from the statement dict and `payment_ref` from tx lines.
+Wizard still gets currency via 3‑tuple header: `("EUR", account_number, [stmts])`.
 
+Return shape from `_parse_file`:
 ```
-[(currency_code, account_number, [statement_dicts])]
-# here: [("EUR", None, [stmt])]
+[("EUR", None, [{
+  "date": "YYYY-MM-DD",
+  "name": "...",
+  "balance_start": 0.0,
+  "balance_end_real": <sum>,
+  "transactions": [
+    {"date": "YYYY-MM-DD", "name": "...", "amount": <float>, "unique_import_id": "...", "ref": "...", "partner_name": "..."}
+  ]
+}] )]
 ```
 
-Statement keys:
-- `date` (ISO string), `name`
-- `currency_code`: "EUR"
-- `balance_start`: 0.0
-- `balance_end_real`: sum of tx amounts
-- `transactions`: list of tx dicts
-
-Transaction keys:
-- `date` (ISO), `name`, `payment_ref` (same as name), `amount` (float), `unique_import_id`
-- optional: `ref`, `partner_name`
-
-Logging:
-- `BA sheet: read N data rows`
-- `BA sheet: returning 3-tuple payload ...`
-
-Other behavior unchanged: XLS/XLSX only, strict headers, EUR-only rows, `BT` right after `OD`, always include `VD`, replace `|`→`/`, newlines→spaces, full `RD`, no partner auto-create.
+Other behavior unchanged: strict headers, EUR-only, XLS/XLSX only, BT after OD, always include VD, `|`→`/`, newlines→spaces, full RD, no partner auto-create.
