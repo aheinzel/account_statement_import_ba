@@ -11,7 +11,7 @@ from odoo.exceptions import UserError
 
 _logger = logging.getLogger(__name__)
 
-# ---- Strict header lists (case-insensitive, exact labels only; no synonyms) ----
+# ---- Strict header lists ----
 REQUIRED_HEADERS = [
     "operation date",
     "value date",
@@ -53,7 +53,6 @@ def _excel_kind(content: bytes) -> Optional[str]:
 _DATE_PATTERNS = ["%Y-%m-%d","%d.%m.%Y","%d.%m.%y","%Y/%m/%d","%d/%m/%Y","%m/%d/%Y"]
 
 def _to_iso_date(val) -> str:
-    """Best-effort to get YYYY-MM-DD string (for logs and payload)."""
     if isinstance(val, datetime):
         return val.date().isoformat()
     if isinstance(val, date):
@@ -93,9 +92,6 @@ def _format_amount(val: float) -> str:
     return f"{val:.2f}"
 
 def _sanitize_val(v: Optional[str]) -> Optional[str]:
-    """Replace newlines with spaces (collapse to single spaces) and replace '|' with '/'.
-    Keep text as-is otherwise (for display).
-    """
     if v is None:
         return None
     s = str(v).replace("\r", " ").replace("\n", " ")
@@ -105,11 +101,9 @@ def _sanitize_val(v: Optional[str]) -> Optional[str]:
     return s if s else None
 
 def _norm_acc(v: Optional[str]) -> str:
-    """Normalize account numbers/IBANs for comparison (remove spaces, upper-case)."""
     return re.sub(r"\s+", "", (v or "")).upper()
 
 def _get_owner_iban(self) -> str:
-    """Return the current journal's IBAN/acc_number (normalized), if any."""
     try:
         if getattr(self, "journal_id", False) and self.journal_id and getattr(self.journal_id, "bank_account_id", False):
             return _norm_acc(self.journal_id.bank_account_id.acc_number)
@@ -118,70 +112,51 @@ def _get_owner_iban(self) -> str:
     return ""
 
 def _choose_partner_name(self, row: Dict[str, object]) -> Optional[str]:
-    """Strict rule:
-    - Require owner IBAN present AND both payer/payee account numbers present.
-    - If exactly one of them equals owner IBAN, return the OTHER side's name.
-    - Otherwise (owner missing, one/both acc missing, none matches owner, or both match): return None.
-    """
+    """Set partner only when both sides' account numbers are present and exactly one equals owner IBAN."""
     owner = _get_owner_iban(self)
     if not owner:
         return None
-
     payer_name = _sanitize_val(row.get("payer name"))
     payee_name = _sanitize_val(row.get("payee name"))
     payer_acc = _norm_acc(row.get("payer account"))
     payee_acc = _norm_acc(row.get("payee account"))
-
     if not payer_acc or not payee_acc:
-        return None  # require both present
-
+        return None
     payer_is_owner = payer_acc == owner
     payee_is_owner = payee_acc == owner
-
-    if payer_is_owner ^ payee_is_owner:  # exactly one matches owner
-        if payer_is_owner:
-            return payee_name or None
-        if payee_is_owner:
-            return payer_name or None
-
-    return None  # ambiguous or no match -> leave empty
+    if payer_is_owner ^ payee_is_owner:
+        return (payee_name if payer_is_owner else payer_name) or None
+    return None
 
 def _build_payment_ref(row: Dict[str, object], amount: float, op_date_iso: str, val_date_iso: str) -> str:
-    """Build the fixed, parseable payment_ref including BOTH payer and payee as provided."""
     pieces = []
     direction = "IN" if amount >= 0 else "OUT"
     pieces.append(f"DIR={direction}")
-
     bt = _sanitize_val(row.get("booking text"))
     if bt:
         pieces.append(f"BT={bt}")
-
     pieces.append(f"OD={op_date_iso}")
     pieces.append(f"VD={val_date_iso}")
     pieces.append(f"CUR={_sanitize_val(row.get('currency')) or 'EUR'}")
     pieces.append(f"AMT={_format_amount(amount)}")
-
     payer_name = _sanitize_val(row.get("payer name"))
     payer_acc_raw = _sanitize_val(row.get("payer account"))
     payer_bc = _sanitize_val(row.get("payer bank code"))
     payee_name = _sanitize_val(row.get("payee name"))
     payee_acc_raw = _sanitize_val(row.get("payee account"))
     payee_bc = _sanitize_val(row.get("payee bank code"))
-
     if payer_name:
         pieces.append(f"PAYER={payer_name}")
     if payer_acc_raw:
         pieces.append(f"PAYER_ACC={payer_acc_raw}")
     if payer_bc:
         pieces.append(f"PAYER_BC={payer_bc}")
-
     if payee_name:
         pieces.append(f"PAYEE={payee_name}")
     if payee_acc_raw:
         pieces.append(f"PAYEE_ACC={payee_acc_raw}")
     if payee_bc:
         pieces.append(f"PAYEE_BC={payee_bc}")
-
     pt = _sanitize_val(row.get("purpose text"))
     if pt:
         pieces.append(f"PT={pt}")
@@ -191,96 +166,12 @@ def _build_payment_ref(row: Dict[str, object], amount: float, op_date_iso: str, 
     rd = _sanitize_val(row.get("record data"))
     if rd is not None:
         pieces.append(f"RD={rd}")
-
     return " | ".join(pieces)
 
 class AccountStatementImportBASheet(models.TransientModel):
     _inherit = "account.statement.import"
 
-    def _parse_file(self, data_file):
-        _logger.info("BA sheet: start parsing")
-        content = data_file if isinstance(data_file, bytes) else base64.b64decode(data_file)
-        kind = _excel_kind(content)
-        if kind is None:
-            _logger.debug("BA sheet: not xls/xlsx -> passing to super()")
-            return super()._parse_file(data_file)
-
-        # Enforce EUR journal
-        if hasattr(self, "journal_id") and self.journal_id:
-            j_cur = self.journal_id.currency_id or self.journal_id.company_id.currency_id
-            if not j_cur or j_cur.name != "EUR":
-                raise UserError(_("This importer requires an EUR journal. Selected journal currency is '%s'.") % (j_cur and j_cur.name or "unknown"))
-
-        rows, header_idx = self._read_excel_rows_strict(content, kind)
-        _logger.info("BA sheet: read %d data rows from Excel.", len(rows))
-
-        txs = []
-        dates = []
-        first_date = None
-        last_date = None
-
-        for idx, r in enumerate(rows, start=1):
-            currency = str(r.get("currency") or "").strip().upper()
-            if currency not in ("EUR", "€"):
-                raise UserError(_("Non-EUR row detected (row %s): %s") % (idx, currency))
-
-            amount = float(_parse_number(r.get("amount")))
-            od_iso = _to_iso_date(r.get("operation date"))
-            vd_iso = _to_iso_date(r.get("value date"))
-            if od_iso:
-                dates.append(od_iso)
-                if first_date is None or od_iso < first_date:
-                    first_date = od_iso
-                if last_date is None or od_iso > last_date:
-                    last_date = od_iso
-
-            partner_name = _choose_partner_name(self, r)
-            payref = _build_payment_ref(r, amount, od_iso, vd_iso)
-
-            # unique id: date + amount + first 32 chars of booking text
-            bt = _sanitize_val(r.get("booking text")) or ""
-            bt_prefix = bt[:32]
-            uid_seed = f"{od_iso}|{amount:.2f}|{bt_prefix}"
-            import hashlib
-            unique_import_id = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest()
-
-            tx = {
-                "date": od_iso or fields.Date.today().isoformat(),
-                "payment_ref": payref or _("Bank transaction"),
-                "amount": amount,
-                "unique_import_id": unique_import_id,
-            }
-            # Do NOT set 'ref'
-            if partner_name:
-                tx["partner_name"] = partner_name
-
-            txs.append(tx)
-
-        if not txs:
-            raise UserError(_("No transactions found after validation."))
-
-        # Statement dates and name
-        stmt_date = last_date or fields.Date.today().isoformat()
-        if first_date and last_date and first_date != last_date:
-            stmt_name = _("Bank Austria import %s..%s (EUR)") % (first_date, last_date)
-        else:
-            sd = first_date or stmt_date
-            stmt_name = _("Bank Austria import %s (EUR)") % sd
-
-        _logger.info("BA sheet: tx count=%d; date range=%s..%s; stmt name=%s", len(txs), first_date, last_date, stmt_name)
-
-        stmt_vals = {
-            "date": stmt_date,
-            "transactions": txs,
-            "name": stmt_name,
-        }
-
-        payload = [("EUR", None, [stmt_vals])]
-        _logger.info("BA sheet: returning 3-tuple payload, stmt keys=%s", sorted(stmt_vals.keys()))
-        return payload
-
     def _read_excel_rows_strict(self, content: bytes, kind: str):
-        # Read first sheet, map only declared headers; fail if required headers missing.
         if kind == "xlsx":
             try:
                 from openpyxl import load_workbook
@@ -311,7 +202,7 @@ class AccountStatementImportBASheet(models.TransientModel):
                         rec[key] = row[col]
                 rows.append(rec)
             return rows, idx
-        else:  # xls
+        else:
             try:
                 import xlrd  # xlrd<2.0
             except Exception as e:
@@ -341,4 +232,83 @@ class AccountStatementImportBASheet(models.TransientModel):
                     rec[key] = val
                 rows.append(rec)
             return rows, idx
+
+    def _parse_file(self, data_file):
+        _logger.info("BA sheet: start parsing")
+        content = data_file if isinstance(data_file, bytes) else base64.b64decode(data_file)
+        kind = _excel_kind(content)
+        if kind is None:
+            _logger.debug("BA sheet: not xls/xlsx -> passing to super()")
+            return super()._parse_file(data_file)
+
+        # Enforce EUR journal
+        if hasattr(self, "journal_id") and self.journal_id:
+            j_cur = self.journal_id.currency_id or self.journal_id.company_id.currency_id
+            if not j_cur or j_cur.name != "EUR":
+                raise UserError(_("This importer requires an EUR journal. Selected journal currency is '%s'.") % (j_cur and j_cur.name or "unknown"))
+
+        rows, header_idx = self._read_excel_rows_strict(content, kind)
+        _logger.info("BA sheet: read %d data rows from Excel.", len(rows))
+
+        txs = []
+        first_date = None
+        last_date = None
+
+        for idx, r in enumerate(rows, start=1):
+            currency = str(r.get("currency") or "").strip().upper()
+            if currency not in ("EUR", "€"):
+                raise UserError(_("Non-EUR row detected (row %s): %s") % (idx, currency))
+
+            amount = float(_parse_number(r.get("amount")))
+            od_iso = _to_iso_date(r.get("operation date"))
+            vd_iso = _to_iso_date(r.get("value date"))
+            if od_iso:
+                if first_date is None or od_iso < first_date:
+                    first_date = od_iso
+                if last_date is None or od_iso > last_date:
+                    last_date = od_iso
+
+            partner_name = _choose_partner_name(self, r)
+            payref = _build_payment_ref(r, amount, od_iso, vd_iso)
+
+            bt = _sanitize_val(r.get("booking text")) or ""
+            bt_prefix = bt[:32]
+            uid_seed = f"{od_iso}|{amount:.2f}|{bt_prefix}"
+            import hashlib
+            unique_import_id = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest()
+
+            tx = {
+                "date": od_iso or fields.Date.today().isoformat(),
+                "payment_ref": payref or _("Bank transaction"),
+                "amount": amount,
+                "unique_import_id": unique_import_id,
+            }
+            if partner_name:
+                tx["partner_name"] = partner_name
+
+            txs.append(tx)
+
+        if not txs:
+            raise UserError(_("No transactions found after validation."))
+
+        # Sort lines ASC by date (and UID for stability)
+        txs.sort(key=lambda t: (t["date"], t["unique_import_id"]))
+
+        stmt_date = last_date or fields.Date.today().isoformat()
+        if first_date and last_date and first_date != last_date:
+            stmt_name = _("Bank Austria import %s..%s (EUR)") % (first_date, last_date)
+        else:
+            sd = first_date or stmt_date
+            stmt_name = _("Bank Austria import %s (EUR)") % sd
+        _logger.info("BA sheet: tx count=%d; sorted ASC; date range=%s..%s; stmt name=%s", len(txs), first_date, last_date, stmt_name)
+
+        stmt_vals = {
+            "date": stmt_date,
+            "transactions": txs,
+            "name": stmt_name,
+        }
+
+        payload = [("EUR", None, [stmt_vals])]
+        _logger.info("BA sheet: returning 3-tuple payload, stmt keys=%s", sorted(stmt_vals.keys()))
+        return payload
 
