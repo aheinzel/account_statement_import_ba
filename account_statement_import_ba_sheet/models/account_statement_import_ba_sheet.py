@@ -216,6 +216,9 @@ class AccountStatementImportBASheet(models.TransientModel):
 
         txs = []
         dates = []
+        first_date = None
+        last_date = None
+
         for idx, r in enumerate(rows, start=1):
             currency = str(r.get("currency") or "").strip().upper()
             if currency not in ("EUR", "€"):
@@ -226,11 +229,18 @@ class AccountStatementImportBASheet(models.TransientModel):
             vd_iso = _to_iso_date(r.get("value date"))
             if od_iso:
                 dates.append(od_iso)
+                if first_date is None or od_iso < first_date:
+                    first_date = od_iso
+                if last_date is None or od_iso > last_date:
+                    last_date = od_iso
 
             partner_name = _choose_partner_name(self, r)
             payref = _build_payment_ref(r, amount, od_iso, vd_iso)
 
-            uid_seed = f"{idx}|{od_iso}|{vd_iso}|{amount}|{r.get('booking text')}|{r.get('purpose text')}|{r.get('record number') or ''}|{r.get('record data') or ''}"
+            # unique id: date + amount + first 32 chars of booking text
+            bt = _sanitize_val(r.get("booking text")) or ""
+            bt_prefix = bt[:32]
+            uid_seed = f"{od_iso}|{amount:.2f}|{bt_prefix}"
             import hashlib
             unique_import_id = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest()
 
@@ -249,18 +259,20 @@ class AccountStatementImportBASheet(models.TransientModel):
         if not txs:
             raise UserError(_("No transactions found after validation."))
 
-        total_amt = sum(t["amount"] for t in txs)
-        _logger.info("BA sheet: tx count=%d, sum=%s", len(txs), total_amt)
-        for i, t in enumerate(txs[:3], start=1):
-            _logger.info("BA sheet: tx[%d] date=%s amount=%s payment_ref=%s uid=%s", i, t.get("date"), t.get("amount"), str(t.get("payment_ref"))[:140], t.get("unique_import_id"))
+        # Statement dates and name
+        stmt_date = last_date or fields.Date.today().isoformat()
+        if first_date and last_date and first_date != last_date:
+            stmt_name = _("Bank Austria import %s..%s (EUR)") % (first_date, last_date)
+        else:
+            sd = first_date or stmt_date
+            stmt_name = _("Bank Austria import %s (EUR)") % sd
 
-        stmt_date = max(dates) if dates else fields.Date.today().isoformat()
+        _logger.info("BA sheet: tx count=%d; date range=%s..%s; stmt name=%s", len(txs), first_date, last_date, stmt_name)
+
         stmt_vals = {
             "date": stmt_date,
             "transactions": txs,
-            "balance_start": 0.0,
-            "balance_end_real": float(0.0 + total_amt),
-            "name": _("Bank Austria import %s (EUR)") % stmt_date,
+            "name": stmt_name,
         }
 
         payload = [("EUR", None, [stmt_vals])]
