@@ -1,10 +1,11 @@
+
 import base64
 import io
 import logging
 from datetime import datetime, date
 from typing import Dict, Optional
 
-from odoo import _, models
+from odoo import _, models, fields
 from odoo.exceptions import UserError
 
 _logger = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ def _excel_kind(content: bytes) -> Optional[str]:
 _DATE_PATTERNS = ["%Y-%m-%d","%d.%m.%Y","%d.%m.%y","%Y/%m/%d","%d/%m/%Y","%m/%d/%Y"]
 
 def _to_iso_date(val) -> str:
-    """Best-effort to get YYYY-MM-DD; returns string always."""
+    """Best-effort to get YYYY-MM-DD string (for logs and UID)."""
     if isinstance(val, datetime):
         return val.date().isoformat()
     if isinstance(val, date):
@@ -63,11 +64,19 @@ def _to_iso_date(val) -> str:
             return datetime.strptime(s, fmt).date().isoformat()
         except Exception:
             pass
-    # Already iso-like?
     try:
         return datetime.fromisoformat(s).date().isoformat()
     except Exception:
-        return s  # as-is; Odoo will validate later
+        return s
+
+def _to_date(val):
+    """Return a real date object using fields.Date.to_date on the iso string."""
+    iso = _to_iso_date(val)
+    try:
+        return fields.Date.to_date(iso)
+    except Exception:
+        # If even that fails, default to today to avoid invalid result structure
+        return fields.Date.today()
 
 def _parse_number(val) -> float:
     if val in (None, ""):
@@ -147,10 +156,12 @@ class AccountStatementImportBASheet(models.TransientModel):
     _inherit = "account.statement.import"
 
     def _parse_file(self, data_file):
+        _logger.info("BA sheet: start parsing")
         content = data_file if isinstance(data_file, bytes) else base64.b64decode(data_file)
         kind = _excel_kind(content)
         if kind is None:
-            return super()._parse_file(data_file)  # not ours
+            _logger.debug("BA sheet: not xls/xlsx -> passing to super()")
+            return super()._parse_file(data_file)
 
         # Enforce EUR journal
         if hasattr(self, "journal_id") and self.journal_id:
@@ -171,10 +182,10 @@ class AccountStatementImportBASheet(models.TransientModel):
                 bad_currency_rows.append(currency or "?")
                 continue
 
-            amount = _parse_number(r.get("amount"))
-            op_date_iso = _to_iso_date(r.get("operation date"))
-            val_date_iso = _to_iso_date(r.get("value date"))
-            name = _build_name(r, amount, op_date_iso, val_date_iso)
+            amount = float(_parse_number(r.get("amount")))
+            od_iso = _to_iso_date(r.get("operation date"))
+            vd_iso = _to_iso_date(r.get("value date"))
+            name = _build_name(r, amount, od_iso, vd_iso)
 
             # partner_name only (do not create partners)
             partner_name = None
@@ -188,14 +199,14 @@ class AccountStatementImportBASheet(models.TransientModel):
             ref = str(ref).strip() if ref else None
 
             # Unique ID built on core fields (not truncated)
-            uid_seed = f"{op_date_iso}|{val_date_iso}|{amount}|{r.get('booking text')}|{r.get('purpose text')}|{ref or ''}|{r.get('record data') or ''}"
+            uid_seed = f"{od_iso}|{vd_iso}|{amount}|{r.get('booking text')}|{r.get('purpose text')}|{ref or ''}|{r.get('record data') or ''}"
             import hashlib
             unique_import_id = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest()
 
             tx = {
-                "date": op_date_iso or datetime.today().date().isoformat(),
+                "date": _to_date(od_iso),  # real date object
                 "name": name or _("Bank transaction"),
-                "amount": float(amount),
+                "amount": amount,
                 "unique_import_id": unique_import_id,
             }
             if ref:
@@ -210,10 +221,11 @@ class AccountStatementImportBASheet(models.TransientModel):
         if not txs:
             raise UserError(_("No transactions found after validation. Check required headers and that Currency is EUR on each row."))
 
-        stmt_date = max(tx["date"] for tx in txs if tx.get("date")) or datetime.today().date().isoformat()
+        stmt_date = max(tx["date"] for tx in txs if tx.get("date")) or fields.Date.today()
         stmt_vals = {
-            "date": stmt_date,
+            "date": stmt_date,                # real date object
             "transactions": txs,
+            "currency_code": "EUR",           # hint for downstream code
             "name": _("Bank Austria import %s (EUR)") % stmt_date,
         }
         _logger.info("BA sheet: built %d transactions, statement date %s.", len(txs), stmt_date)
@@ -281,3 +293,4 @@ class AccountStatementImportBASheet(models.TransientModel):
                     rec[key] = val
                 rows.append(rec)
             return rows, idx
+
