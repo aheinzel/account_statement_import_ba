@@ -2,6 +2,7 @@
 import base64
 import io
 import logging
+import re
 from datetime import datetime, date
 from typing import Dict, Optional, List, Tuple
 
@@ -36,10 +37,9 @@ OPTIONAL_HEADERS = [
 ALL_HEADERS = REQUIRED_HEADERS + OPTIONAL_HEADERS
 
 def _norm(s: str) -> str:
-    # normalize header: trim, collapse internal spaces to single space, lowercase
     s = (s or "").strip()
-    s = " ".join(s.split())
-    return s.lower()
+    s = " ".join(s.split()).lower()
+    return s
 
 def _excel_kind(content: bytes) -> Optional[str]:
     sig_xlsx = bytes([0x50, 0x4B, 0x03, 0x04])  # ZIP 'PK..'
@@ -86,52 +86,102 @@ def _parse_number(val) -> float:
     try:
         return float(s)
     except Exception:
-        import re
         s2 = re.sub(r"[^0-9\.-]","", s)
         return float(s2) if s2 else 0.0
 
 def _format_amount(val: float) -> str:
     return f"{val:.2f}"
 
-def _sanitize_val(v):
-    """Replace newlines with spaces (collapse to single spaces) and replace '|' with '/'."""
+def _sanitize_val(v: Optional[str]) -> Optional[str]:
+    """Replace newlines with spaces (collapse to single spaces) and replace '|' with '/'.
+    Keep text as-is otherwise (for display).
+    """
     if v is None:
         return None
     s = str(v).replace("\r", " ").replace("\n", " ")
-    s = " ".join(s.split())  # collapse whitespace
+    s = " ".join(s.split())
     s = s.replace("|", "/")
     s = s.strip()
     return s if s else None
 
-def _build_name(row: Dict[str, object], amount: float, op_date_iso: str, val_date_iso: str) -> str:
-    # Fixed, key=value pipeline; **BT placed immediately after OD**; always include VD
-    direction = "IN" if amount >= 0 else "OUT"
-    # Counterparty based on direction
-    if amount >= 0:
-        cp = _sanitize_val(row.get("payer name"))
-        cp_acc = _sanitize_val(row.get("payer account"))
-        cp_bc = _sanitize_val(row.get("payer bank code"))
-    else:
-        cp = _sanitize_val(row.get("payee name"))
-        cp_acc = _sanitize_val(row.get("payee account"))
-        cp_bc = _sanitize_val(row.get("payee bank code"))
+def _norm_acc(v: Optional[str]) -> str:
+    """Normalize account numbers/IBANs for comparison (remove spaces, upper-case)."""
+    return re.sub(r"\s+", "", (v or "")).upper()
 
+def _get_owner_iban(self) -> str:
+    """Return the current journal's IBAN/acc_number (normalized), if any."""
+    try:
+        if getattr(self, "journal_id", False) and self.journal_id and getattr(self.journal_id, "bank_account_id", False):
+            return _norm_acc(self.journal_id.bank_account_id.acc_number)
+    except Exception:
+        pass
+    return ""
+
+def _choose_partner_name(self, row: Dict[str, object]) -> Optional[str]:
+    """Strict rule:
+    - Require owner IBAN present AND both payer/payee account numbers present.
+    - If exactly one of them equals owner IBAN, return the OTHER side's name.
+    - Otherwise (owner missing, one/both acc missing, none matches owner, or both match): return None.
+    """
+    owner = _get_owner_iban(self)
+    if not owner:
+        return None
+
+    payer_name = _sanitize_val(row.get("payer name"))
+    payee_name = _sanitize_val(row.get("payee name"))
+    payer_acc = _norm_acc(row.get("payer account"))
+    payee_acc = _norm_acc(row.get("payee account"))
+
+    if not payer_acc or not payee_acc:
+        return None  # require both present
+
+    payer_is_owner = payer_acc == owner
+    payee_is_owner = payee_acc == owner
+
+    if payer_is_owner ^ payee_is_owner:  # exactly one matches owner
+        if payer_is_owner:
+            return payee_name or None
+        if payee_is_owner:
+            return payer_name or None
+
+    return None  # ambiguous or no match -> leave empty
+
+def _build_payment_ref(row: Dict[str, object], amount: float, op_date_iso: str, val_date_iso: str) -> str:
+    """Build the fixed, parseable payment_ref including BOTH payer and payee as provided."""
     pieces = []
+    direction = "IN" if amount >= 0 else "OUT"
     pieces.append(f"DIR={direction}")
-    pieces.append(f"OD={op_date_iso}")
-    # Booking text right after OD
+
     bt = _sanitize_val(row.get("booking text"))
     if bt:
         pieces.append(f"BT={bt}")
+
+    pieces.append(f"OD={op_date_iso}")
     pieces.append(f"VD={val_date_iso}")
     pieces.append(f"CUR={_sanitize_val(row.get('currency')) or 'EUR'}")
     pieces.append(f"AMT={_format_amount(amount)}")
-    if cp:
-        pieces.append(f"CP={cp}")
-    if cp_acc:
-        pieces.append(f"CP_ACC={cp_acc}")
-    if cp_bc:
-        pieces.append(f"CP_BC={cp_bc}")
+
+    payer_name = _sanitize_val(row.get("payer name"))
+    payer_acc_raw = _sanitize_val(row.get("payer account"))
+    payer_bc = _sanitize_val(row.get("payer bank code"))
+    payee_name = _sanitize_val(row.get("payee name"))
+    payee_acc_raw = _sanitize_val(row.get("payee account"))
+    payee_bc = _sanitize_val(row.get("payee bank code"))
+
+    if payer_name:
+        pieces.append(f"PAYER={payer_name}")
+    if payer_acc_raw:
+        pieces.append(f"PAYER_ACC={payer_acc_raw}")
+    if payer_bc:
+        pieces.append(f"PAYER_BC={payer_bc}")
+
+    if payee_name:
+        pieces.append(f"PAYEE={payee_name}")
+    if payee_acc_raw:
+        pieces.append(f"PAYEE_ACC={payee_acc_raw}")
+    if payee_bc:
+        pieces.append(f"PAYEE_BC={payee_bc}")
+
     pt = _sanitize_val(row.get("purpose text"))
     if pt:
         pieces.append(f"PT={pt}")
@@ -139,8 +189,9 @@ def _build_name(row: Dict[str, object], amount: float, op_date_iso: str, val_dat
     if ref:
         pieces.append(f"REF={ref}")
     rd = _sanitize_val(row.get("record data"))
-    if rd is not None:  # include untrimmed; no dedupe
+    if rd is not None:
         pieces.append(f"RD={rd}")
+
     return " | ".join(pieces)
 
 class AccountStatementImportBASheet(models.TransientModel):
@@ -163,76 +214,57 @@ class AccountStatementImportBASheet(models.TransientModel):
         rows, header_idx = self._read_excel_rows_strict(content, kind)
         _logger.info("BA sheet: read %d data rows from Excel.", len(rows))
 
-        # Build transactions
         txs = []
-        bad_currency_rows = []
         dates = []
         for idx, r in enumerate(rows, start=1):
-            # Currency enforcement (row-level)
             currency = str(r.get("currency") or "").strip().upper()
             if currency not in ("EUR", "€"):
-                bad_currency_rows.append(currency or "?")
-                continue
+                raise UserError(_("Non-EUR row detected (row %s): %s") % (idx, currency))
 
             amount = float(_parse_number(r.get("amount")))
             od_iso = _to_iso_date(r.get("operation date"))
             vd_iso = _to_iso_date(r.get("value date"))
-            name = _build_name(r, amount, od_iso, vd_iso)
             if od_iso:
                 dates.append(od_iso)
 
-            # partner_name only (do not create partners)
-            partner_name = None
-            if amount >= 0 and r.get("payer name"):
-                partner_name = str(r.get("payer name") or "").strip()
-            elif amount < 0 and r.get("payee name"):
-                partner_name = str(r.get("payee name") or "").strip()
+            partner_name = _choose_partner_name(self, r)
+            payref = _build_payment_ref(r, amount, od_iso, vd_iso)
 
-            # Reference: prefer 'Reference' else 'Record Number'
-            ref = (r.get("reference") or r.get("record number") or None)
-            ref = str(ref).strip() if ref else None
-
-            # Unique ID built on core fields (+ row index to ensure uniqueness within file)
-            uid_seed = f"{idx}|{od_iso}|{vd_iso}|{amount}|{r.get('booking text')}|{r.get('purpose text')}|{ref or ''}|{r.get('record data') or ''}"
+            uid_seed = f"{idx}|{od_iso}|{vd_iso}|{amount}|{r.get('booking text')}|{r.get('purpose text')}|{r.get('record number') or ''}|{r.get('record data') or ''}"
             import hashlib
             unique_import_id = hashlib.sha1(uid_seed.encode("utf-8")).hexdigest()
 
             tx = {
-                "date": od_iso or fields.Date.today().isoformat(),  # ISO string
-                "name": name or _("Bank transaction"),
+                "date": od_iso or fields.Date.today().isoformat(),
+                "payment_ref": payref or _("Bank transaction"),
                 "amount": amount,
                 "unique_import_id": unique_import_id,
             }
-            if ref:
-                tx["ref"] = ref
+            # Do NOT set 'ref'
             if partner_name:
                 tx["partner_name"] = partner_name
+
             txs.append(tx)
 
-        if bad_currency_rows:
-            raise UserError(_("Non-EUR rows detected. All rows must have Currency = EUR. Offending currencies: %s") % ", ".join(sorted(set(bad_currency_rows))))
-
         if not txs:
-            raise UserError(_("No transactions found after validation. Check required headers and that Currency is EUR on each row."))
+            raise UserError(_("No transactions found after validation."))
 
-        # Diagnostics
         total_amt = sum(t["amount"] for t in txs)
         _logger.info("BA sheet: tx count=%d, sum=%s", len(txs), total_amt)
         for i, t in enumerate(txs[:3], start=1):
-            _logger.info("BA sheet: tx[%d] date=%s amount=%s name=%s uid=%s", i, t.get("date"), t.get("amount"), t.get("name")[:120], t.get("unique_import_id"))
+            _logger.info("BA sheet: tx[%d] date=%s amount=%s payment_ref=%s uid=%s", i, t.get("date"), t.get("amount"), str(t.get("payment_ref"))[:140], t.get("unique_import_id"))
 
         stmt_date = max(dates) if dates else fields.Date.today().isoformat()
         stmt_vals = {
-            "date": stmt_date,            # ISO string
+            "date": stmt_date,
             "transactions": txs,
             "balance_start": 0.0,
             "balance_end_real": float(0.0 + total_amt),
             "name": _("Bank Austria import %s (EUR)") % stmt_date,
         }
 
-        # Return 3-tuple shape expected by your wizard: (currency_code, account_number, [statements])
-        payload: List[Tuple[str, Optional[str], List[Dict]]] = [("EUR", None, [stmt_vals])]
-        _logger.info("BA sheet: returning 3-tuple payload w/ stmt keys=%s", sorted(stmt_vals.keys()))
+        payload = [("EUR", None, [stmt_vals])]
+        _logger.info("BA sheet: returning 3-tuple payload, stmt keys=%s", sorted(stmt_vals.keys()))
         return payload
 
     def _read_excel_rows_strict(self, content: bytes, kind: str):

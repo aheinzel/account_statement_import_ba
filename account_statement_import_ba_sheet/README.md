@@ -1,12 +1,19 @@
-# Bank Austria Statement Import (XLS/XLSX, strict EUR) — Diagnostic Build
+# Bank Austria Statement Import (XLS/XLSX, strict EUR) — 18.0.3.4.4
 
-Adds extra logging to understand "Diese Datei enthält keinen Vorgang" cases.
+**Partner selection (strict)**
+- Set `partner_name` **only** when **both** `PAYER_ACC` and `PAYEE_ACC` are present **and**
+  **exactly one** equals your journal’s own account number (IBAN). In that case, we use the other side’s name.
+- In all other cases (missing owner IBAN, missing either account, neither matches owner, or both match), we **do not** set any partner.
 
-- Logs tx **count**, **sum**, and the **first 3 tx** (date, amount, name, uid)
-- Returns the 3‑tuple that your wizard expects: `[("EUR", None, [stmt])]`
-- Statement keys: `date`, `name`, `balance_start`, `balance_end_real`, `transactions`
-- Tx keys: `date`, `name`, `amount`, `unique_import_id` (+ optional `ref`, `partner_name`)
+**payment_ref**
+- Still includes **both** parties as provided in the Excel (after basic sanitization), with the fixed key order:  
+  `DIR → BT → OD → VD → CUR → AMT → PAYER → PAYER_ACC → PAYER_BC → PAYEE → PAYEE_ACC → PAYEE_BC → PT → REF → RD`.
 
-Everything else unchanged (strict headers, EUR-only rows, XLS/XLSX only, BT after OD, always include VD, `|`→`/`, newlines→spaces, full RD).
+**Other notes**
+- Transactions carry **`payment_ref`** only (no `name`) and **no `ref`**.
+- EUR-only rows; strict required headers; XLS & XLSX support (requires `openpyxl` for XLSX; `xlrd<2.0` if you need legacy XLS).
+- Returns `[("EUR", None, [statement_dict])]` for the OCA wizard.
 
-If the wizard still says "no operation", compare our logged **uids** with existing statement lines — they may all be deduplicated by the wizard.
+**Abbreviations**
+- `DIR` direction, `BT` booking text, `OD` operation date, `VD` value date, `CUR` currency, `AMT` amount,
+  `PAYER(_ACC/_BC)`, `PAYEE(_ACC/_BC)`, `PT` purpose text, `REF` reference, `RD` record data.
