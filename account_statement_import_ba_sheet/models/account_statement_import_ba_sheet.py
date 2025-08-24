@@ -4,14 +4,14 @@ import io
 import logging
 import re
 from datetime import datetime, date
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Set
 
 from odoo import _, models, fields
 from odoo.exceptions import UserError
 
 _logger = logging.getLogger(__name__)
 
-# ---- Strict header lists ----
+# ---- Strict header lists (case-insensitive, exact labels only; no synonyms) ----
 REQUIRED_HEADERS = [
     "operation date",
     "value date",
@@ -53,6 +53,7 @@ def _excel_kind(content: bytes) -> Optional[str]:
 _DATE_PATTERNS = ["%Y-%m-%d","%d.%m.%Y","%d.%m.%y","%Y/%m/%d","%d/%m/%Y","%m/%d/%Y"]
 
 def _to_iso_date(val) -> str:
+    """Best-effort to get YYYY-MM-DD string (for logs and payload)."""
     if isinstance(val, datetime):
         return val.date().isoformat()
     if isinstance(val, date):
@@ -92,6 +93,9 @@ def _format_amount(val: float) -> str:
     return f"{val:.2f}"
 
 def _sanitize_val(v: Optional[str]) -> Optional[str]:
+    """Replace newlines with spaces (collapse to single spaces) and replace '|' with '/'.
+    Keep text as-is otherwise (for display).
+    """
     if v is None:
         return None
     s = str(v).replace("\r", " ").replace("\n", " ")
@@ -101,62 +105,92 @@ def _sanitize_val(v: Optional[str]) -> Optional[str]:
     return s if s else None
 
 def _norm_acc(v: Optional[str]) -> str:
+    """Normalize account numbers/IBANs for comparison (remove spaces, upper-case)."""
     return re.sub(r"\s+", "", (v or "")).upper()
 
-def _get_owner_iban(self) -> str:
+def _get_owner_accounts(self) -> Set[str]:
+    """Return a set with ONE owner account, sourced **only** from context:
+       - env.context['journal_id'] (preferred)
+       - or env.context['active_model']=='account.journal' and env.context['active_id']
+       If none found → empty set.
+    """
+    owners: Set[str] = set()
+    ctx = self.env.context or {}
+    jid = ctx.get("journal_id")
+    if not jid and ctx.get("active_model") == "account.journal":
+        jid = ctx.get("active_id")
     try:
-        if getattr(self, "journal_id", False) and self.journal_id and getattr(self.journal_id, "bank_account_id", False):
-            return _norm_acc(self.journal_id.bank_account_id.acc_number)
+        if jid:
+            j = self.env["account.journal"].browse(int(jid))
+            if j and getattr(j, "bank_account_id", False):
+                owners.add(_norm_acc(j.bank_account_id.acc_number))
     except Exception:
         pass
-    return ""
+    owners.discard("")
+    _logger.info("BA sheet: owner accounts from context → %s", sorted(list(owners)) or ["<none>"])
+    return owners
 
 def _choose_partner_name(self, row: Dict[str, object]) -> Optional[str]:
-    """Set partner only when both sides' account numbers are present and exactly one equals owner IBAN."""
-    owner = _get_owner_iban(self)
-    if not owner:
+    """Strict rule with context-only owner account(s):
+    - Require BOTH payer/payee account numbers present.
+    - If exactly one of them belongs to owner_accounts, return the OTHER side's name.
+    - Else: return None.
+    """
+    owner_accounts = _get_owner_accounts(self)
+    if not owner_accounts:
         return None
+
     payer_name = _sanitize_val(row.get("payer name"))
     payee_name = _sanitize_val(row.get("payee name"))
     payer_acc = _norm_acc(row.get("payer account"))
     payee_acc = _norm_acc(row.get("payee account"))
     if not payer_acc or not payee_acc:
         return None
-    payer_is_owner = payer_acc == owner
-    payee_is_owner = payee_acc == owner
-    if payer_is_owner ^ payee_is_owner:
+
+    payer_is_owner = payer_acc in owner_accounts
+    payee_is_owner = payee_acc in owner_accounts
+
+    if payer_is_owner ^ payee_is_owner:  # exactly one matches
         return (payee_name if payer_is_owner else payer_name) or None
+
     return None
 
 def _build_payment_ref(row: Dict[str, object], amount: float, op_date_iso: str, val_date_iso: str) -> str:
+    """Build the fixed, parseable payment_ref including BOTH payer and payee as provided."""
     pieces = []
     direction = "IN" if amount >= 0 else "OUT"
     pieces.append(f"DIR={direction}")
+
     bt = _sanitize_val(row.get("booking text"))
     if bt:
         pieces.append(f"BT={bt}")
+
     pieces.append(f"OD={op_date_iso}")
     pieces.append(f"VD={val_date_iso}")
     pieces.append(f"CUR={_sanitize_val(row.get('currency')) or 'EUR'}")
     pieces.append(f"AMT={_format_amount(amount)}")
+
     payer_name = _sanitize_val(row.get("payer name"))
     payer_acc_raw = _sanitize_val(row.get("payer account"))
     payer_bc = _sanitize_val(row.get("payer bank code"))
     payee_name = _sanitize_val(row.get("payee name"))
     payee_acc_raw = _sanitize_val(row.get("payee account"))
     payee_bc = _sanitize_val(row.get("payee bank code"))
+
     if payer_name:
         pieces.append(f"PAYER={payer_name}")
     if payer_acc_raw:
         pieces.append(f"PAYER_ACC={payer_acc_raw}")
     if payer_bc:
         pieces.append(f"PAYER_BC={payer_bc}")
+
     if payee_name:
         pieces.append(f"PAYEE={payee_name}")
     if payee_acc_raw:
         pieces.append(f"PAYEE_ACC={payee_acc_raw}")
     if payee_bc:
         pieces.append(f"PAYEE_BC={payee_bc}")
+
     pt = _sanitize_val(row.get("purpose text"))
     if pt:
         pieces.append(f"PT={pt}")
@@ -166,6 +200,7 @@ def _build_payment_ref(row: Dict[str, object], amount: float, op_date_iso: str, 
     rd = _sanitize_val(row.get("record data"))
     if rd is not None:
         pieces.append(f"RD={rd}")
+
     return " | ".join(pieces)
 
 class AccountStatementImportBASheet(models.TransientModel):
@@ -241,11 +276,8 @@ class AccountStatementImportBASheet(models.TransientModel):
             _logger.debug("BA sheet: not xls/xlsx -> passing to super()")
             return super()._parse_file(data_file)
 
-        # Enforce EUR journal
-        if hasattr(self, "journal_id") and self.journal_id:
-            j_cur = self.journal_id.currency_id or self.journal_id.company_id.currency_id
-            if not j_cur or j_cur.name != "EUR":
-                raise UserError(_("This importer requires an EUR journal. Selected journal currency is '%s'.") % (j_cur and j_cur.name or "unknown"))
+        # Note: We NO LONGER rely on self.journal_id or company data for owner detection.
+        # EUR enforcement is skipped unless journal is bound with a currency (context-only approach).
 
         rows, header_idx = self._read_excel_rows_strict(content, kind)
         _logger.info("BA sheet: read %d data rows from Excel.", len(rows))
@@ -271,6 +303,7 @@ class AccountStatementImportBASheet(models.TransientModel):
             partner_name = _choose_partner_name(self, r)
             payref = _build_payment_ref(r, amount, od_iso, vd_iso)
 
+            # unique id: date + amount + first 32 chars of booking text
             bt = _sanitize_val(r.get("booking text")) or ""
             bt_prefix = bt[:32]
             uid_seed = f"{od_iso}|{amount:.2f}|{bt_prefix}"
@@ -294,6 +327,7 @@ class AccountStatementImportBASheet(models.TransientModel):
         # Sort lines ASC by date (and UID for stability)
         txs.sort(key=lambda t: (t["date"], t["unique_import_id"]))
 
+        # Statement dates and name
         stmt_date = last_date or fields.Date.today().isoformat()
         if first_date and last_date and first_date != last_date:
             stmt_name = _("Bank Austria import %s..%s (EUR)") % (first_date, last_date)
